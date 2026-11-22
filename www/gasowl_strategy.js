@@ -4,9 +4,7 @@ class GasOwlStrategy {
     static async generate(config, hass) {
         // Ensure the sensor entity is found
         const sensorEntityId = "sensor.gasowl";
-        console.log(hass.states)
         const sensorState = hass.states[sensorEntityId];
-        console.log(sensorState)
 
         if (!sensorState) {
             console.error(`Sensor entity not found: ${sensorEntityId}`);
@@ -29,9 +27,18 @@ class GasOwlStrategy {
         // Extract installation data from the sensor state attributes
         const installationData = sensorState.attributes.installations || [];
 
-        // Call the python script to create sensors dynamically
-        console.log("call python service")
-        await hass.callService('python_script', 'create_gasowl_sensors', { entity_id: sensorEntityId });
+        // Version 1.2 and later name a real sensor for each scale. Only an older setup, which
+        // has none, needs the python script to make its stand-in sensors.
+        const hasRealSensors = installationData.every(installation =>
+            installation.processed_data.every(scale => scale.bottle_level_entity)
+        );
+        if (!hasRealSensors) {
+            try {
+                await hass.callService('python_script', 'create_gasowl_sensors', { entity_id: sensorEntityId });
+            } catch (err) {
+                console.warn("GasOwl: python_script.create_gasowl_sensors is not available", err);
+            }
+        }
 
         const views = installationData.map(installation => {
             const installationId = installation.id;
@@ -46,7 +53,8 @@ class GasOwlStrategy {
                 scale.side === "left" ? "Left" : scale.side === "right" ? "Right" : `Scale ${scale.scale_index}`;
 
             const barCardEntities = scales.map(scale => ({
-                entity: `gasowl.installation_${installationId}_scale_${scale.scale_index}_bottle_level`,
+                entity: scale.bottle_level_entity
+                    || `gasowl.installation_${installationId}_scale_${scale.scale_index}_bottle_level`,
                 name: `${scaleLabel(scale)}\nUpdated: ${new Date(scale.time).toLocaleString()}`,
                 // name: `Scale ${scale.scale_index}`,
                 severity: [

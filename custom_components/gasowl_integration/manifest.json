@@ -1,11 +1,14 @@
 {
     "domain": "gasowl_integration",
     "name": "GasOwl Integration",
+    "codeowners": [],
+    "config_flow": true,
+    "dependencies": [],
     "documentation": "https://github.com/ventionlab/pub_gasowl-home-assistant",
-    "version": "1.1.0",
+    "integration_type": "hub",
+    "iot_class": "cloud_polling",
     "requirements": [
         "boto3"
     ],
-    "dependencies": [],
-    "codeowners": []
+    "version": "1.2.0"
 }

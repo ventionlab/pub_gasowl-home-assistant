@@ -1,69 +1,49 @@
-import base64
-import json
-import logging
-import time
-from datetime import datetime, timedelta
+"""GasOwl sensors: a bottle level and a gas weight for each scale, and a summary sensor.
 
-import boto3
-import requests
+Each installation is a device, and each of its scales has two sensors, named for the side the
+bottle is on. They update on their own, whether or not a dashboard is open, and come back after
+a restart. sensor.gasowl is the summary the GasOwl dashboard strategy reads; it keeps the
+attributes it had in 1.1, and now also names the real sensors for each scale.
+"""
+
+import logging
+
 import voluptuous as vol
-from botocore.exceptions import BotoCoreError, ClientError
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_NAME
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.config_entries import SOURCE_IMPORT
+from homeassistant.const import (
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    PERCENTAGE,
+    Platform,
+    UnitOfMass,
+)
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import (
+    CONF_CLIENT_ID,
+    CONF_URL,
+    DOMAIN,
+    ISSUE_DEPRECATED_YAML,
+    ISSUE_DEPRECATED_YAML_IMPORT_FAILED,
+    WEB_APP_URL,
+)
 
 logger = logging.getLogger(__name__)
 
-CONF_URL = "url"
-CONF_CLIENT_ID = "client_id"
-CONF_USERNAME = "username"
-CONF_PASSWORD = "password"
-SCAN_INTERVAL = timedelta(minutes=5)
-
-COGNITO_REGION = "ap-southeast-2"
-# Renew the ID token this long before it expires, so a poll never goes out on a stale one.
-TOKEN_RENEW_MARGIN = 300  # seconds
-REQUEST_TIMEOUT = 30  # seconds
-
-# GasOwl returns only the signed-in owner's own installations. "export" is the read-only
-# role, used whenever the token offers it; otherwise "user" is named explicitly.
-EXPORT_ROLE = "export"
-USER_ROLE = "user"
-HASURA_CLAIMS = "https://hasura.io/jwt/claims"
-
-_QUERY = """
-query getData {
-    installation%s {
-        id
-        name
-        tube {
-            dev_eui
-            serial_number
-            left_scale_index
-            scales(order_by: {index: asc}) {
-                id
-                index
-                serial_number
-                processed_data(limit: 1, order_by: {time: desc}) {
-                    bottle_level
-                    gas_weight
-                    id
-                    time
-                }
-            }
-        }
-    }
-}
-"""
-QUERY = {
-    EXPORT_ROLE: _QUERY % "",
-    USER_ROLE: _QUERY % "(where: {account_id: {_is_null: false}})",
-}
-
-# GasOwl's minimum-version check starts its refusal with this.
-APP_UPDATE_REQUIRED = "APP_UPDATE_REQUIRED"
-
+# configuration.yaml, as version 1.1 and earlier were set up. Read only to move it across.
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_URL): cv.string,
@@ -74,233 +54,203 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
+SIDE_LABEL = {"left": "Left", "right": "Right"}
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    session = CognitoSession(
-        config[CONF_CLIENT_ID], config[CONF_USERNAME], config[CONF_PASSWORD]
+
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+    """A configuration.yaml entry: move it into Settings > Devices & services."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_IMPORT},
+        data={key: config[key] for key in (CONF_URL, CONF_CLIENT_ID, CONF_USERNAME, CONF_PASSWORD)},
     )
-    add_entities(
-        [GraphQLSensor(config[CONF_URL], session, config[CONF_NAME])],
-        True,
-    )
-
-
-class SignInError(Exception):
-    """GasOwl would not sign this login in."""
-
-
-class CognitoSession:
-    """Signs in with the password once, then keeps the ID token fresh with the refresh token.
-
-    The password is used again only when the refresh token stops being accepted (it
-    expires, or the account was signed out everywhere).
-    """
-
-    def __init__(self, client_id, username, password):
-        self._client_id = client_id
-        self._username = username
-        self._password = password
-        self._client = boto3.client(service_name="cognito-idp", region_name=COGNITO_REGION)
-        self._id_token = None
-        self._refresh_token = None
-        self._expires_at = 0.0
-
-    def id_token(self, force_renew=False):
-        """A current ID token, renewing or signing in only when needed."""
-        if (
-            self._id_token
-            and not force_renew
-            and time.time() < self._expires_at - TOKEN_RENEW_MARGIN
-        ):
-            return self._id_token
-
-        if self._refresh_token:
-            try:
-                self._authenticate(
-                    "REFRESH_TOKEN_AUTH", {"REFRESH_TOKEN": self._refresh_token}
-                )
-                logger.debug("Renewed the GasOwl token")
-                return self._id_token
-            except ClientError as err:
-                # Only an expired or revoked refresh token sends us back to the password.
-                # Anything else (throttling, an AWS fault) fails this poll and keeps the
-                # refresh token for the next one.
-                if err.response.get("Error", {}).get("Code") != "NotAuthorizedException":
-                    raise
-                logger.info("GasOwl no longer accepts the saved sign-in, signing in again")
-                self._refresh_token = None
-
-        self._sign_in_with_password()
-        return self._id_token
-
-    def _sign_in_with_password(self):
-        try:
-            self._authenticate(
-                "USER_PASSWORD_AUTH",
-                {"USERNAME": self._username, "PASSWORD": self._password},
-            )
-        except ClientError as err:
-            error = err.response.get("Error", {})
-            message = error.get("Message", "")
-            if APP_UPDATE_REQUIRED in message:
-                raise SignInError(
-                    "GasOwl refused the sign-in because the GasOwl app on your phone is "
-                    "older than the minimum version. Update the GasOwl app, open it and "
-                    "sign in once, and this integration will sign in at its next update. "
-                    f"({message.split(APP_UPDATE_REQUIRED, 1)[1].lstrip(': ').rstrip('.')})"
-                ) from None
-            raise SignInError(
-                f"GasOwl refused the sign-in ({error.get('Code', 'error')}): {message}"
-            ) from None
-        logger.info("Signed in to GasOwl")
-
-    def _authenticate(self, flow, parameters):
-        response = self._client.initiate_auth(
-            ClientId=self._client_id, AuthFlow=flow, AuthParameters=parameters
+    if result["type"] == FlowResultType.ABORT and result["reason"] != "already_configured":
+        logger.error(
+            "Could not move the GasOwl entry from configuration.yaml (%s). Add GasOwl in "
+            "Settings > Devices & services instead.",
+            result["reason"],
         )
-        result = response.get("AuthenticationResult")
-        if not result:
-            raise SignInError(
-                f"GasOwl asked for an extra sign-in step ({response.get('ChallengeName')}). "
-                "Sign in to the GasOwl app with this login first."
-            )
-        self._id_token = result["IdToken"]
-        self._expires_at = time.time() + result.get("ExpiresIn", 3600)
-        # A refresh normally returns no new refresh token; keep the one we have.
-        if result.get("RefreshToken"):
-            self._refresh_token = result["RefreshToken"]
-
-
-def _allowed_roles(id_token):
-    """The Hasura roles this ID token offers. Read only to choose a role, never trusted."""
-    try:
-        payload = id_token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload)).get(HASURA_CLAIMS) or {}
-        if isinstance(claims, str):
-            claims = json.loads(claims)
-        claims = {key.lower(): value for key, value in claims.items()}
-        return list(claims.get("x-hasura-allowed-roles") or [])
-    except (IndexError, ValueError, AttributeError, TypeError):
-        return []
-
-
-def _side(scale_index, left_scale_index):
-    """"left" or "right" for a scale, as GasOwl itself decides it, or None if unknown.
-
-    Which of a Hub's two scales is on the left is set per Hub (left_scale_index), and the
-    GasOwl app can swap it, so it is never assumed from the scale's own number.
-    """
-    if left_scale_index is None:
-        return None
-    return "left" if scale_index == left_scale_index else "right"
-
-
-def _token_rejected(errors):
-    return any(
-        (e.get("extensions") or {}).get("code") == "invalid-jwt"
-        or "JWTExpired" in (e.get("message") or "")
-        for e in errors
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            ISSUE_DEPRECATED_YAML_IMPORT_FAILED,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=ISSUE_DEPRECATED_YAML_IMPORT_FAILED,
+            translation_placeholders={"reason": result["reason"]},
+        )
+        return
+    ir.async_delete_issue(hass, DOMAIN, ISSUE_DEPRECATED_YAML_IMPORT_FAILED)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        ISSUE_DEPRECATED_YAML,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_DEPRECATED_YAML,
     )
 
 
-class GraphQLSensor(Entity):
-    def __init__(self, url, session, name):
-        self._url = url
-        self._session = session
-        self._name = name
-        self._state = None
-        self._attributes = {}
+async def async_setup_entry(hass, entry, async_add_entities):
+    coordinator = entry.runtime_data
+    async_add_entities([GasOwlSummarySensor(coordinator, entry)])
+
+    known = set()
+
+    def add_new_scales():
+        new = []
+        for installation_id, installation in (coordinator.data or {}).items():
+            for scale_index in installation["scales"]:
+                if (installation_id, scale_index) in known:
+                    continue
+                known.add((installation_id, scale_index))
+                new += [
+                    BottleLevelSensor(coordinator, installation_id, scale_index),
+                    GasWeightSensor(coordinator, installation_id, scale_index),
+                ]
+        if new:
+            async_add_entities(new)
+
+    add_new_scales()
+    entry.async_on_unload(coordinator.async_add_listener(add_new_scales))
+
+
+class ScaleSensor(CoordinatorEntity, SensorEntity):
+    """One reading of one scale on one installation."""
+
+    _attr_has_entity_name = True
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    key = None
+    label = None
+
+    def __init__(self, coordinator, installation_id, scale_index):
+        super().__init__(coordinator)
+        self._installation_id = installation_id
+        self._scale_index = scale_index
+        self._attr_unique_id = f"{installation_id}_scale_{scale_index}_{self.key}"
+        installation = coordinator.data[installation_id]
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"installation_{installation_id}")},
+            name=installation["name"],
+            manufacturer="Vention Lab",
+            model="GasOwl",
+            serial_number=installation["tube_serial_number"],
+            configuration_url=WEB_APP_URL,
+        )
+
+    @property
+    def _scale(self):
+        installation = (self.coordinator.data or {}).get(self._installation_id) or {}
+        return installation.get("scales", {}).get(self._scale_index)
+
+    @property
+    def available(self):
+        return super().available and self._scale is not None
 
     @property
     def name(self):
-        return self._name
+        scale = self._scale or {}
+        where = SIDE_LABEL.get(scale.get("side"), f"Scale {self._scale_index}")
+        return f"{where} {self.label}"
 
     @property
-    def state(self):
-        return self._state
+    def native_value(self):
+        scale = self._scale
+        return scale.get(self.key) if scale else None
 
     @property
     def extra_state_attributes(self):
-        return self._attributes
+        scale = self._scale or {}
+        return {
+            "side": scale.get("side"),
+            "scale_index": self._scale_index,
+            "scale_serial_number": scale.get("serial_number"),
+            "measured_at": scale.get("time"),
+        }
 
-    def update(self):
-        logger.debug("Starting update for %s", self._name)
-        try:
-            data = self._query()
-            if data.get("errors") and _token_rejected(data["errors"]):
-                logger.debug("GasOwl rejected the token, renewing it and asking again")
-                data = self._query(force_renew=True)
-        except SignInError as err:
-            logger.error("%s", err)
-            self._state = "Error"
-            return
-        except (requests.exceptions.RequestException, BotoCoreError, ClientError, ValueError) as err:
-            logger.error("Error fetching GasOwl data: %s", err)
-            self._state = "Error"
-            return
 
-        if data.get("errors"):
-            # Keep the last good data rather than blanking the dashboard for a cycle.
-            logger.warning(
-                "GasOwl returned an error, keeping the last data: %s",
-                "; ".join(e.get("message", "") for e in data["errors"]),
+class BottleLevelSensor(ScaleSensor):
+    key = "bottle_level"
+    label = "bottle level"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_icon = "mdi:gas-cylinder"
+    _attr_suggested_display_precision = 0
+
+
+class GasWeightSensor(ScaleSensor):
+    key = "gas_weight"
+    label = "gas weight"
+    _attr_device_class = SensorDeviceClass.WEIGHT
+    _attr_native_unit_of_measurement = UnitOfMass.KILOGRAMS
+    _attr_suggested_display_precision = 1
+
+
+class GasOwlSummarySensor(CoordinatorEntity, SensorEntity):
+    """sensor.gasowl: when GasOwl last answered, and every installation's latest readings."""
+
+    _attr_name = "GasOwl"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:owl"
+    # The attributes change with every reading; keep them out of the recorder's history.
+    _unrecorded_attributes = frozenset({"installations"})
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_summary"
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+
+        @callback
+        def scale_sensor_registered(event):
+            # Name a scale sensor here as soon as it has an entity id, rather than at the
+            # next poll, so the dashboard never falls back to the old python script.
+            if event.data.get("action") != "create":
+                return
+            registered = er.async_get(self.hass).async_get(event.data["entity_id"])
+            if registered and registered.platform == DOMAIN and registered.unique_id != self.unique_id:
+                self.async_write_ha_state()
+
+        self.async_on_remove(
+            self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, scale_sensor_registered)
+        )
+
+    @property
+    def native_value(self):
+        return self.coordinator.last_success
+
+    @property
+    def extra_state_attributes(self):
+        registry = er.async_get(self.hass)
+
+        def entity_id(installation_id, scale_index, key):
+            return registry.async_get_entity_id(
+                Platform.SENSOR, DOMAIN, f"{installation_id}_scale_{scale_index}_{key}"
             )
-            self._state = "Error"
-            return
 
-        logger.debug("Response data: %s", data)
-        installations = (data.get("data") or {}).get("installation") or []
-        installation_list = []
-
-        for installation in installations:
-            tube = installation.get("tube")
-            if tube:
-                scales = tube.get("scales", [])
-                left_scale_index = tube.get("left_scale_index")
-                processed_data_list = []
-
-                for scale in scales:
-                    processed_data = scale.get("processed_data", [])
-                    if processed_data:
-                        for data_point in processed_data:
-                            processed_data_list.append(
-                                {
-                                    "scale_index": scale["index"],
-                                    "side": _side(scale["index"], left_scale_index),
-                                    "time": data_point.get("time"),
-                                    "bottle_level": data_point.get("bottle_level"),
-                                    "gas_weight": data_point.get("gas_weight"),
-                                }
-                            )
-
-                installation_list.append(
+        installations = []
+        for installation_id, installation in (self.coordinator.data or {}).items():
+            readings = []
+            for scale_index, scale in installation["scales"].items():
+                if scale["time"] is None:
+                    continue
+                readings.append(
                     {
-                        "id": installation["id"],
-                        "name": installation["name"],
-                        "left_scale_index": left_scale_index,
-                        "processed_data": processed_data_list,
+                        "scale_index": scale_index,
+                        "side": scale["side"],
+                        "time": scale["time"],
+                        "bottle_level": scale["bottle_level"],
+                        "gas_weight": scale["gas_weight"],
+                        "bottle_level_entity": entity_id(installation_id, scale_index, "bottle_level"),
+                        "gas_weight_entity": entity_id(installation_id, scale_index, "gas_weight"),
                     }
                 )
-
-        self._attributes = {"installations": installation_list}
-        self._state = datetime.now().isoformat()
-        logger.debug("Stored installation data in attributes: %s", self._attributes)
-
-    def _query(self, force_renew=False):
-        token = self._session.id_token(force_renew)
-        role = EXPORT_ROLE if EXPORT_ROLE in _allowed_roles(token) else USER_ROLE
-        logger.debug("Reading GasOwl as the %s role", role)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "X-Hasura-Role": role,
-        }
-        response = requests.post(
-            self._url,
-            json={"query": QUERY[role]},
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.json()
+            installations.append(
+                {
+                    "id": installation_id,
+                    "name": installation["name"],
+                    "left_scale_index": installation["left_scale_index"],
+                    "processed_data": readings,
+                }
+            )
+        return {"installations": installations}

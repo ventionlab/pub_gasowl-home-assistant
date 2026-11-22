@@ -1,0 +1,59 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "GasOwl",
+                "description": "Sign in with the email and password you use in the GasOwl app. Home Assistant only reads your gas levels.",
+                "data": {
+                    "username": "Email",
+                    "password": "Password"
+                },
+                "sections": {
+                    "advanced": {
+                        "name": "Advanced",
+                        "description": "Leave these as they are unless Vention Lab asks you to change them.",
+                        "data": {
+                            "url": "GasOwl API address",
+                            "client_id": "Sign-in client ID"
+                        }
+                    }
+                }
+            },
+            "reauth_confirm": {
+                "title": "Sign in to GasOwl again",
+                "description": "GasOwl no longer accepts the saved login for {username}. Enter the password you use in the GasOwl app.",
+                "data": {
+                    "password": "Password"
+                }
+            }
+        },
+        "error": {
+            "invalid_auth": "GasOwl does not recognise that email and password. Use the login you use in the GasOwl app.",
+            "app_update_required": "GasOwl refused the sign-in because the GasOwl app on your phone is older than the minimum version. Update the GasOwl app, open it and sign in once, then try again.",
+            "cannot_connect": "Could not reach GasOwl. Check the internet connection and try again.",
+            "unknown": "Something unexpected went wrong. The Home Assistant log has the details."
+        },
+        "abort": {
+            "already_configured": "This GasOwl account is already set up.",
+            "reauth_successful": "Signed in to GasOwl again.",
+            "invalid_auth": "GasOwl does not recognise that email and password.",
+            "app_update_required": "GasOwl refused the sign-in because the GasOwl app on your phone is older than the minimum version.",
+            "cannot_connect": "Could not reach GasOwl.",
+            "unknown": "Something unexpected went wrong. The Home Assistant log has the details."
+        }
+    },
+    "issues": {
+        "deprecated_yaml": {
+            "title": "Remove GasOwl from configuration.yaml",
+            "description": "GasOwl is now set up in **Settings > Devices & services**, and your configuration.yaml entry has been moved there. Remove the `gasowl_integration` entry under `sensor:` from configuration.yaml, and its two GasOwl lines from secrets.yaml, then restart Home Assistant."
+        },
+        "deprecated_yaml_import_failed": {
+            "title": "GasOwl could not move your configuration.yaml entry",
+            "description": "GasOwl is now set up in **Settings > Devices & services**, but moving your configuration.yaml entry there failed ({reason}). Add GasOwl in **Settings > Devices & services**, then remove the `gasowl_integration` entry under `sensor:` from configuration.yaml and restart Home Assistant."
+        },
+        "app_update_required": {
+            "title": "Update the GasOwl app on your phone",
+            "description": "GasOwl refused to sign in {username} because the GasOwl app on your phone is older than the minimum version. Update the GasOwl app, open it and sign in once. Home Assistant signs in again at its next update, and this message then goes away."
+        }
+    }
+}
