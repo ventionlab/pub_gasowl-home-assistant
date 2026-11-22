@@ -1,0 +1,9 @@
+sensor:
+  - platform: gasowl_integration
+    name: GasOwl
+    url: "https://api.gasowl.co.nz/api/v1/graphql"
+    client_id: "5ilu9qjm10kr6703ku0hj3nj0q"
+    username: !secret gasowl_username
+    password: !secret gasowl_password
+
+python_script:

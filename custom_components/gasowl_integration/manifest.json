@@ -1,0 +1,11 @@
+{
+    "domain": "gasowl_integration",
+    "name": "GasOwl Integration",
+    "documentation": "https://github.com/ventionlab/pub_gasowl-home-assistant",
+    "version": "1.1.0",
+    "requirements": [
+        "boto3"
+    ],
+    "dependencies": [],
+    "codeowners": []
+}
